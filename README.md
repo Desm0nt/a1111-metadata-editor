@@ -14,10 +14,6 @@
 </p>
 
 <p align="center">
-  <em>Perfect for cleaning up metadata before uploading to Civitai — bypass overzealous AI content filters by removing or editing flagged words in your prompts</em>
-</p>
-
-<p align="center">
   <a href="#features">Features</a> •
   <a href="#installation">Installation</a> •
   <a href="#usage">Usage</a> •
@@ -139,3 +135,4 @@ MIT License — see [LICENSE](LICENSE) for details.
 <p align="center">
   Made with ❤️ for the Stable Diffusion community
 </p>
+
