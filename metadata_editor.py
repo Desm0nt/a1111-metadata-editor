@@ -6,6 +6,7 @@ import os
 import struct
 import zlib
 import shutil
+import json
 from flask import Flask, render_template_string, request, jsonify, send_file
 
 app = Flask(__name__)
@@ -30,25 +31,141 @@ def make_chunk(chunk_type, data):
     crc = zlib.crc32(chunk_type_bytes + data) & 0xffffffff
     return struct.pack('>I', len(data)) + chunk_type_bytes + data + struct.pack('>I', crc)
 
-def extract_png_metadata(png_path):
+# ============== ComfyUI Converter ==============
+def is_comfyui_png(png_path):
+    """Check if PNG has ComfyUI metadata"""
+    try:
+        with open(png_path, 'rb') as f:
+            data = f.read()
+        for chunk_type, chunk_data, _ in read_png_chunks(data):
+            if chunk_type == 'tEXt':
+                null_pos = chunk_data.find(b'\x00')
+                if null_pos != -1:
+                    keyword = chunk_data[:null_pos].decode('latin-1')
+                    if keyword in ('prompt', 'workflow'):
+                        return True
+        return False
+    except:
+        return False
+
+def extract_comfy_prompts(png_path):
+    """Extract positive and negative prompts from ComfyUI metadata"""
     with open(png_path, 'rb') as f:
         data = f.read()
+    
+    chunks = read_png_chunks(data)
+    prompt_data = None
+    
+    for chunk_type, chunk_data, _ in chunks:
+        if chunk_type == 'tEXt':
+            null_pos = chunk_data.find(b'\x00')
+            if null_pos != -1:
+                keyword = chunk_data[:null_pos].decode('latin-1')
+                if keyword == 'prompt':
+                    value = chunk_data[null_pos+1:].decode('utf-8', errors='replace')
+                    try:
+                        prompt_data = json.loads(value)
+                    except:
+                        return None, None
+                    break
+    
+    if not prompt_data:
+        return None, None
+    
+    positive = ""
+    negative = ""
+    
+    # Search for text-containing nodes
+    for node_id, node_data in prompt_data.items():
+        class_type = node_data.get('class_type', '')
+        inputs = node_data.get('inputs', {})
+        meta = node_data.get('_meta', {})
+        title = meta.get('title', '').lower()
+        
+        # Various text encoding nodes
+        if class_type in ('CLIPTextEncode', 'CLIPTextEncodeSDXL', 'TextEncodeEditAdvanced', 
+                          'FluxGuidance', 'ConditioningConcat'):
+            # Check for 'text' or 'prompt' field
+            text = inputs.get('text') or inputs.get('prompt', '')
+            
+            if text:
+                # Determine if positive or negative
+                if 'negative' in title or 'neg' in title:
+                    negative = text
+                elif not positive:  # First text is usually positive
+                    positive = text
+    
+    return positive, negative
+
+def convert_comfy_to_a1111(png_path, create_backup=True):
+    """Convert ComfyUI PNG to A1111 format in-place"""
+    positive, negative = extract_comfy_prompts(png_path)
+    
+    if not positive:
+        return False
+    
+    # Build A1111-style metadata
+    metadata = positive
+    if negative:
+        metadata += f"\nNegative prompt: {negative}"
+    metadata += "\nSteps: 20, Sampler: Euler, CFG scale: 7, Seed: -1, Size: 512x512"
+    
+    # Read original PNG
+    with open(png_path, 'rb') as f:
+        data = f.read()
+    
+    chunks = read_png_chunks(data)
+    
+    # Build new PNG with A1111 parameters
+    new_data = b'\x89PNG\r\n\x1a\n'
+    written = False
+    
+    for chunk_type, chunk_data, _ in chunks:
+        # Skip ComfyUI chunks
+        if chunk_type == 'tEXt':
+            null_pos = chunk_data.find(b'\x00')
+            if null_pos != -1:
+                keyword = chunk_data[:null_pos].decode('latin-1')
+                if keyword in ('prompt', 'workflow'):
+                    continue
+        
+        # Insert A1111 parameters before IDAT
+        if chunk_type == 'IDAT' and not written:
+            new_data += make_chunk('tEXt', b'parameters\x00' + metadata.encode('latin-1', errors='replace'))
+            written = True
+        
+        new_data += make_chunk(chunk_type, chunk_data)
+    
+    # Backup
+    if create_backup:
+        backup_path = png_path + '.comfy_backup'
+        if not os.path.exists(backup_path):
+            shutil.copy2(png_path, backup_path)
+    
+    # Write
+    with open(png_path, 'wb') as f:
+        f.write(new_data)
+    
+    return True
+
+def extract_png_metadata(png_path):
+    """Extract metadata from PNG, auto-converting ComfyUI if needed"""
+    # First try to read A1111 metadata
+    with open(png_path, 'rb') as f:
+        data = f.read()
+    
     for chunk_type, chunk_data, _ in read_png_chunks(data):
         if chunk_type == 'tEXt':
             null_pos = chunk_data.find(b'\x00')
             if null_pos != -1 and chunk_data[:null_pos].decode('latin-1') == 'parameters':
                 return chunk_data[null_pos+1:].decode('latin-1')
         elif chunk_type == 'iTXt':
-            # iTXt format: keyword\x00compression_flag\x00compression_method\x00language\x00translated_keyword\x00text
             null_pos = chunk_data.find(b'\x00')
             if null_pos != -1 and chunk_data[:null_pos].decode('latin-1') == 'parameters':
-                # Skip: keyword\x00 + compression_flag(1) + compression_method(1) + language\x00 + translated\x00
                 rest = chunk_data[null_pos+1:]
-                # compression_flag and compression_method are single bytes
                 compression_flag = rest[0]
-                # Skip compression_flag, compression_method, then find two more nulls (language, translated_keyword)
-                text_start = 2  # skip compression bytes
-                for _ in range(2):  # skip language and translated_keyword
+                text_start = 2
+                for _ in range(2):
                     next_null = rest.find(b'\x00', text_start)
                     if next_null != -1:
                         text_start = next_null + 1
@@ -56,8 +173,14 @@ def extract_png_metadata(png_path):
                 if compression_flag == 0:
                     return text_data.decode('utf-8')
                 else:
-                    import zlib
                     return zlib.decompress(text_data).decode('utf-8')
+    
+    # If no A1111 metadata found, check if it's ComfyUI and convert
+    if is_comfyui_png(png_path):
+        if convert_comfy_to_a1111(png_path, create_backup=True):
+            # Read again after conversion
+            return extract_png_metadata(png_path)
+    
     return ""
 
 def write_png_metadata(png_path, metadata_text, create_backup=True):
@@ -310,6 +433,7 @@ body {
 .status-badge.pristine { background: var(--bg-subtle); color: var(--text-muted); }
 .status-badge.modified { background: #FEF3C7; color: #D97706; }
 .status-badge.saved { background: var(--success-subtle); color: var(--success); }
+.status-badge.comfy { background: #DBEAFE; color: #2563EB; }
 .item-info { flex: 1; min-width: 0; }
 .item-name {
     font-size: 13px;
@@ -781,12 +905,23 @@ async function loadFolder() {
         div.className = 'image-item';
         div.dataset.path = img.path;
         
-        // Status: pristine (нетронутый), saved (сохранён/есть бэкап), modified (изменён, не сохранён)
-        const status = img.has_backup ? 'saved' : 'pristine';
-        const statusIcon = img.has_backup ? '✓' : '○';
-        const statusTitle = img.has_backup ? 'Редактировался' : 'Оригинал';
+        // Status: pristine, saved, comfy
+        let status, statusIcon, statusTitle;
+        if (img.is_comfy) {
+            status = 'comfy';
+            statusIcon = '🔄';
+            statusTitle = 'ComfyUI (будет конвертирован)';
+        } else if (img.has_backup) {
+            status = 'saved';
+            statusIcon = '✓';
+            statusTitle = 'Редактировался';
+        } else {
+            status = 'pristine';
+            statusIcon = '○';
+            statusTitle = 'Оригинал';
+        }
         
-        imageStates[img.path] = { hasBackup: img.has_backup, modified: false };
+        imageStates[img.path] = { hasBackup: img.has_backup, modified: false, isComfy: img.is_comfy };
         
         div.innerHTML = `
             <div class="thumb-wrapper">
@@ -801,7 +936,12 @@ async function loadFolder() {
         list.appendChild(div);
     });
     document.getElementById('imageCount').textContent = data.images.length;
-    showToast(`Загружено ${data.images.length} изображений`, 'success');
+    
+    let msg = `Загружено ${data.images.length} изображений`;
+    if (data.comfy_count > 0) {
+        msg += ` (${data.comfy_count} ComfyUI)`;
+    }
+    showToast(msg, 'success');
 }
 
 async function selectImage(path, el) {
@@ -814,6 +954,12 @@ async function selectImage(path, el) {
     el.classList.add('active');
     currentImage = path;
     document.getElementById('preview').innerHTML = `<img src="/api/image?path=${encodeURIComponent(path)}">`;
+    
+    // Show loading for ComfyUI files
+    if (imageStates[path]?.isComfy) {
+        showToast('Конвертация ComfyUI → A1111...', 'success');
+    }
+    
     const res = await fetch('/api/metadata?path=' + encodeURIComponent(path));
     const data = await res.json();
     const metadata = data.metadata || '';
@@ -822,6 +968,13 @@ async function selectImage(path, el) {
     
     if (imageStates[path]) {
         imageStates[path].original = metadata;
+        // After conversion, update status
+        if (imageStates[path].isComfy && metadata) {
+            imageStates[path].isComfy = false;
+            imageStates[path].hasBackup = true;
+            updateItemStatus(path, 'saved');
+            showToast('ComfyUI конвертирован в A1111', 'success');
+        }
     }
 }
 
@@ -852,6 +1005,9 @@ function updateItemStatus(path, status) {
     } else if (status === 'modified') {
         badge.textContent = '●';
         badge.title = 'Не сохранён';
+    } else if (status === 'comfy') {
+        badge.textContent = '🔄';
+        badge.title = 'ComfyUI';
     }
 }
 
@@ -958,12 +1114,30 @@ def list_images():
     if not folder or not os.path.isdir(folder):
         return jsonify({'error': 'Папка не найдена'})
     images = []
+    converted_count = 0
     for f in sorted(os.listdir(folder)):
         if f.lower().endswith(('.png', '.jpg', '.jpeg')):
             full_path = os.path.join(folder, f)
             has_backup = os.path.exists(full_path + '.backup')
-            images.append({'name': f, 'path': full_path, 'has_backup': has_backup})
-    return jsonify({'images': images, 'folder': folder})
+            is_comfy = False
+            
+            # Check if it's a ComfyUI file
+            if f.lower().endswith('.png'):
+                is_comfy = is_comfyui_png(full_path)
+                if is_comfy:
+                    converted_count += 1
+            
+            images.append({
+                'name': f, 
+                'path': full_path, 
+                'has_backup': has_backup,
+                'is_comfy': is_comfy
+            })
+    return jsonify({
+        'images': images, 
+        'folder': folder,
+        'comfy_count': converted_count
+    })
 
 @app.route('/api/thumb')
 def get_thumb():
